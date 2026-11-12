@@ -63,14 +63,17 @@ impl Repo {
         if !out.status.success() {
             bail!("git ls-files failed: {}", String::from_utf8_lossy(&out.stderr));
         }
-        let mut files: Vec<String> = out
-            .stdout
-            .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
+        let mut files = Vec::new();
+        for raw in out.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+            // Manifest keys are strings; a lossy name would silently not
+            // match the real file, so refuse instead.
+            let f = String::from_utf8(raw.to_vec())
+                .map_err(|_| anyhow::anyhow!("non-UTF-8 path not supported: {:?}", String::from_utf8_lossy(raw)))?;
             // Never mirror a build dir, even if the repo forgot to ignore it.
-            .filter(|f| !f.starts_with("target/"))
-            .collect();
+            if !f.starts_with("target/") {
+                files.push(f);
+            }
+        }
         files.sort();
         files.dedup();
         Ok(files)

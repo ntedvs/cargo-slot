@@ -6,6 +6,7 @@ use std::fs::{self, File, Metadata, Permissions};
 use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -35,6 +36,11 @@ pub fn sync(root: &Path, files: &[String], dst: &Path, manifest: &mut Manifest, 
     let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
     let dirs: HashSet<String> = files.iter().flat_map(|f| ancestors(f)).map(str::to_string).collect();
     let mut stats = Stats::default();
+    // Copies are staged outside the mirror so temp names can never collide
+    // with mirrored paths. Same parent, so same filesystem for rename.
+    let staging = staging_dir(dst)?;
+    clear(&staging)?;
+    fs::create_dir(&staging)?;
 
     // 1. Delete anything in the mirror that isn't wanted: stale entries,
     //    and files builds created. A leftover `src/bin/x.rs` would otherwise
@@ -52,7 +58,7 @@ pub fn sync(root: &Path, files: &[String], dst: &Path, manifest: &mut Manifest, 
     let results: Vec<(&String, Outcome)> = files
         .par_iter()
         .map(|rel| {
-            let out = sync_one(root, dst, rel, old.get(rel), same_origin).with_context(|| format!("syncing {rel}"))?;
+            let out = sync_one(root, dst, &staging, rel, old.get(rel), same_origin).with_context(|| format!("syncing {rel}"))?;
             Ok((rel, out))
         })
         .collect::<Result<_>>()?;
@@ -113,7 +119,12 @@ fn ancestors(rel: &str) -> impl Iterator<Item = &str> {
 /// Recursively delete entries under `dst/dir` that are neither wanted leaves
 /// nor ancestors of one. Does not follow symlinks.
 fn prune(dst: &Path, dir: &str, wanted: &HashSet<&str>, dirs: &HashSet<String>, removed: &mut usize) -> Result<()> {
-    for entry in fs::read_dir(dst.join(dir))? {
+    // We need to add and remove entries here even if a build made it read-only.
+    let here = dst.join(dir);
+    if fs::symlink_metadata(&here)?.mode() & 0o700 != 0o700 {
+        fs::set_permissions(&here, Permissions::from_mode(0o755))?;
+    }
+    for entry in fs::read_dir(&here)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if dir.is_empty() && name == ".git" {
@@ -127,7 +138,7 @@ fn prune(dst: &Path, dir: &str, wanted: &HashSet<&str>, dirs: &HashSet<String>, 
             // Kept; sync_one fixes type or content.
         } else {
             if ft.is_dir() {
-                fs::remove_dir_all(entry.path())?;
+                remove_dir_all_force(&entry.path())?;
             } else {
                 fs::remove_file(entry.path())?;
             }
@@ -137,12 +148,14 @@ fn prune(dst: &Path, dir: &str, wanted: &HashSet<&str>, dirs: &HashSet<String>, 
     Ok(())
 }
 
-fn sync_one(root: &Path, dst: &Path, rel: &str, old: Option<&Entry>, same_origin: bool) -> Result<Outcome> {
+fn sync_one(root: &Path, dst: &Path, staging: &Path, rel: &str, old: Option<&Entry>, same_origin: bool) -> Result<Outcome> {
     let s = root.join(rel);
     let d = dst.join(rel);
     let md = match fs::symlink_metadata(&s) {
-        Ok(m) if !m.is_dir() => m,
-        // Deleted but still in the index, or a submodule: not mirrored.
+        // Regular files and symlinks only. Directories are deleted-but-indexed
+        // paths or submodules; FIFOs, sockets and devices can't be copied
+        // (and reading a FIFO would block).
+        Ok(m) if m.is_file() || m.file_type().is_symlink() => m,
         Ok(_) => return Ok(Outcome::Gone { removed: remove_leaf(&d)? }),
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Outcome::Gone { removed: remove_leaf(&d)? }),
         Err(e) => return Err(e.into()),
@@ -173,7 +186,12 @@ fn sync_one(root: &Path, dst: &Path, rel: &str, old: Option<&Entry>, same_origin
         }
     }
 
-    let hash = hash_file(&s)?;
+    let hash = match hash_file(&s) {
+        Ok(h) => h,
+        // Deleted since it was listed.
+        Err(e) if is_not_found(&e) => return Ok(Outcome::Gone { removed: remove_leaf(&d)? }),
+        Err(e) => return Err(e),
+    };
     let mut entry = Entry { size, mtime, mode, hash, link: false, dst: None };
 
     if let Some(st) = dst_stamp {
@@ -199,17 +217,36 @@ fn sync_one(root: &Path, dst: &Path, rel: &str, old: Option<&Entry>, same_origin
     }
 
     clear(&d)?;
-    let name = d.file_name().context("empty path")?.to_string_lossy();
-    let tmp = d.with_file_name(format!(".{name}.cargo-slot-tmp"));
-    clear(&tmp)?;
-    fs::copy(&s, &tmp)?;
-    fs::set_permissions(&tmp, Permissions::from_mode(mode))?;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = staging.join(format!("{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    match fs::copy(&s, &tmp) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Outcome::Gone { removed: true }),
+        Err(e) => return Err(e.into()),
+    }
     // fs::copy may clone and keep the source mtime. Cargo decides freshness
     // by mtime, so a changed file must look newer than any prior build.
+    // The copy carries the source mode, which may be read-only, so make it
+    // writable for this and apply the real mode last.
+    fs::set_permissions(&tmp, Permissions::from_mode(0o600))?;
     File::options().write(true).open(&tmp)?.set_modified(SystemTime::now())?;
+    // Record what was actually written; the source may have changed since
+    // it was hashed above.
+    entry.hash = hash_file(&tmp)?;
+    fs::set_permissions(&tmp, Permissions::from_mode(mode))?;
     fs::rename(&tmp, &d)?;
     entry.dst = Some(stamp(&fs::symlink_metadata(&d)?));
     Ok(Outcome::Copied(entry))
+}
+
+/// Sibling of the mirror used for staging copies: `<slot>/src.staging`.
+fn staging_dir(dst: &Path) -> Result<PathBuf> {
+    let name = dst.file_name().context("mirror path has no name")?.to_string_lossy();
+    Ok(dst.with_file_name(format!("{name}.staging")))
+}
+
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == ErrorKind::NotFound)
 }
 
 /// Reject anything but plain relative paths.
@@ -256,11 +293,29 @@ fn remove_leaf(p: &Path) -> Result<bool> {
 /// Remove whatever is at `p`. Parents must already be real directories.
 fn clear(p: &Path) -> Result<()> {
     match fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(p)?,
+        Ok(m) if m.is_dir() => remove_dir_all_force(p)?,
         Ok(_) => fs::remove_file(p)?,
         Err(_) => {}
     }
     Ok(())
+}
+
+/// `remove_dir_all`, retrying after making directories writable. Builds can
+/// leave read-only trees behind, and entries can't be unlinked from those.
+fn remove_dir_all_force(p: &Path) -> Result<()> {
+    if fs::remove_dir_all(p).is_ok() {
+        return Ok(());
+    }
+    fn unlock(dir: &Path) {
+        let _ = fs::set_permissions(dir, Permissions::from_mode(0o700));
+        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                unlock(&e.path());
+            }
+        }
+    }
+    unlock(p);
+    fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))
 }
 
 /// Point the mirror's `.git` at the real worktree's git dir, so build
@@ -301,6 +356,7 @@ fn nanos(t: SystemTime) -> i128 {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::process::Command;
 
     struct Env {
         _tmp: tempfile::TempDir,
@@ -504,5 +560,109 @@ mod tests {
         assert!(!e.dst.join("stray").exists());
         assert!(e.dst.join(".git").exists(), "git pointer is kept");
         assert!(e.dst.join("src/main.rs").exists());
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn staging_never_collides_with_mirrored_paths() {
+        // Names the old in-place temp scheme would have used for `foo`.
+        let mut e = Env::new();
+        e.write("foo", "1");
+        e.write(".foo.cargo-slot-tmp/payload", "keep me");
+        e.write(".foo.cargo-slot-tmp-x", "me too");
+        let files = ["foo", ".foo.cargo-slot-tmp/payload", ".foo.cargo-slot-tmp-x"];
+        e.sync(&files);
+        e.write("foo", "2");
+        let st = e.sync(&files);
+        assert_eq!(st, Stats { files: 3, copied: 1, removed: 0 });
+        assert_eq!(e.read(".foo.cargo-slot-tmp/payload"), "keep me");
+        assert_eq!(e.read(".foo.cargo-slot-tmp-x"), "me too");
+        assert_eq!(names(&e.dst), [".foo.cargo-slot-tmp", ".foo.cargo-slot-tmp-x", "foo"]);
+        assert!(names(&staging_dir(&e.dst).unwrap()).is_empty(), "staging left behind files");
+    }
+
+    #[test]
+    fn read_only_source_files() {
+        let mut e = Env::new();
+        e.write("ro.rs", "a");
+        fs::set_permissions(e.src.join("ro.rs"), Permissions::from_mode(0o444)).unwrap();
+        e.sync(&["ro.rs"]);
+        assert_eq!(fs::metadata(e.dst.join("ro.rs")).unwrap().mode() & 0o777, 0o444);
+
+        // Changing a read-only file replaces the read-only mirror copy.
+        fs::set_permissions(e.src.join("ro.rs"), Permissions::from_mode(0o644)).unwrap();
+        e.write("ro.rs", "b");
+        fs::set_permissions(e.src.join("ro.rs"), Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(e.sync(&["ro.rs"]).copied, 1);
+        assert_eq!(e.read("ro.rs"), "b");
+    }
+
+    #[test]
+    fn read_only_dirs_left_in_slot() {
+        let mut e = Env::new();
+        e.write("src/lib.rs", "x");
+        e.sync(&["src/lib.rs"]);
+        // A build leaves a read-only tree, and makes a kept dir read-only.
+        fs::create_dir_all(e.dst.join("gen/sub")).unwrap();
+        fs::write(e.dst.join("gen/sub/f"), "").unwrap();
+        fs::write(e.dst.join("src/stray"), "").unwrap();
+        for d in ["gen/sub", "gen", "src"] {
+            fs::set_permissions(e.dst.join(d), Permissions::from_mode(0o555)).unwrap();
+        }
+        e.write("src/lib.rs", "y");
+        let st = e.sync(&["src/lib.rs"]);
+        assert_eq!(st.removed, 2);
+        assert!(!e.dst.join("gen").exists());
+        assert_eq!(e.read("src/lib.rs"), "y");
+    }
+
+    #[test]
+    fn special_files_are_skipped() {
+        let mut e = Env::new();
+        e.write("a.rs", "a");
+        let fifo = e.src.join("pipe");
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let sock = std::os::unix::net::UnixListener::bind(e.src.join("sock")).unwrap();
+        // Reading a FIFO blocks forever, so fail instead of hanging. A stuck
+        // thread is detached and dies with the test process.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let st = e.sync(&["a.rs", "pipe", "sock"]);
+            tx.send((st, e)).unwrap();
+        });
+        let (st, e) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("sync blocked on a FIFO");
+        drop(sock);
+        assert_eq!(st.files, 1);
+        assert_eq!(names(&e.dst), ["a.rs"]);
+    }
+
+    #[test]
+    fn case_only_rename() {
+        let mut e = Env::new();
+        e.write("Foo.rs", "x");
+        e.sync(&["Foo.rs"]);
+        fs::rename(e.src.join("Foo.rs"), e.src.join("foo.rs")).unwrap();
+        e.sync(&["foo.rs"]);
+        assert_eq!(names(&e.dst), ["foo.rs"]);
+        assert_eq!(e.read("foo.rs"), "x");
+    }
+
+    #[test]
+    fn unicode_and_odd_names() {
+        let mut e = Env::new();
+        let files = ["caf\u{e9}.rs", "sp ace.rs", "new\nline.rs", "-dash.rs", "q\"uote.rs"];
+        for f in files {
+            e.write(f, f);
+        }
+        e.sync(&files);
+        for f in files {
+            assert_eq!(e.read(f), f);
+        }
+        assert_eq!(e.sync(&files).copied, 0);
     }
 }

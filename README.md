@@ -79,6 +79,8 @@ Cargo runs with `CARGO_SLOT_WORKTREE` set to the real worktree root.
 
 - The files mirrored are what `git ls-files --cached --others --exclude-standard`
   lists. Ignored files (like `.env`) and submodule contents are not mirrored.
+  Only regular files and symlinks are copied; FIFOs, sockets and devices are
+  skipped. Non-UTF-8 paths are an error.
 - Builds and tests run in the slot. Anything they write to the source tree
   (e.g. snapshot updates) lands in the slot, not your worktree, and is
   deleted on the next sync.
