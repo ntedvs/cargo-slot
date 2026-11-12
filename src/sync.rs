@@ -23,7 +23,8 @@ enum Outcome {
 }
 
 /// Make `dst` an exact mirror of `files` under `root`, plus the root `.git`
-/// pointer. Only files whose content differs are rewritten, so untouched
+/// file (managed by `Repo::link_slot`). Only files whose content differs are
+/// rewritten, so untouched
 /// files keep their mtimes and cargo's fingerprints stay fresh.
 ///
 /// Never writes outside `dst`: paths are normalized so no leaf is an
@@ -180,10 +181,15 @@ fn sync_one(root: &Path, dst: &Path, staging: &Path, rel: &str, old: Option<&Ent
     let dst_stamp = dmd.as_ref().filter(|m| m.is_file()).map(stamp);
 
     // Fast path: source unchanged and destination exactly as we left it.
-    if let (Some(o), Some(st)) = (old, &dst_stamp) {
-        if !o.link && o.dst.as_ref() == Some(st) && same_origin && o.size == size && o.mtime == mtime && o.mode == mode {
-            return Ok(Outcome::Same(o.clone()));
-        }
+    if let (Some(o), Some(st)) = (old, &dst_stamp)
+        && !o.link
+        && o.dst.as_ref() == Some(st)
+        && same_origin
+        && o.size == size
+        && o.mtime == mtime
+        && o.mode == mode
+    {
+        return Ok(Outcome::Same(o.clone()));
     }
 
     let hash = match hash_file(&s) {
@@ -318,19 +324,57 @@ fn remove_dir_all_force(p: &Path) -> Result<()> {
     fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))
 }
 
-/// Point the mirror's `.git` at the real worktree's git dir, so build
-/// scripts that shell out to git (version stamps etc.) still work.
-pub fn write_git_pointer(git_dir: &Path, dst: &Path) -> Result<()> {
-    let p = dst.join(".git");
-    let want = format!("gitdir: {}\n", git_dir.display());
-    if fs::read_to_string(&p).ok().as_deref() != Some(want.as_str()) || !fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
-        clear(&p)?;
-        fs::write(&p, want)?;
+/// Copy lockfiles that cargo created or changed in the mirror back to the
+/// worktree, where plain cargo would have written them. Candidates are the
+/// mirrored lockfiles plus `Cargo.lock` in the invocation dir and each of
+/// its ancestors (where cargo creates a new one). A lockfile whose worktree
+/// copy changed during the build is left alone and reported as a conflict.
+///
+/// Returns (path, written) for each lockfile that differs.
+pub fn write_back_locks(root: &Path, dst: &Path, cwd_rel: &Path, manifest: &Manifest) -> Result<Vec<(String, bool)>> {
+    let mut candidates: std::collections::BTreeSet<String> = manifest
+        .keys()
+        .filter(|k| k == &"Cargo.lock" || k.ends_with("/Cargo.lock"))
+        .cloned()
+        .collect();
+    for dir in cwd_rel.ancestors() {
+        candidates.insert(dir.join("Cargo.lock").to_string_lossy().into_owned());
     }
-    Ok(())
+
+    let mut out = Vec::new();
+    for rel in candidates {
+        let mirrored = dst.join(&rel);
+        if !fs::symlink_metadata(&mirrored).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let new = hash_file(&mirrored)?;
+        let synced = manifest.get(&rel).filter(|e| !e.link).map(|e| e.hash.clone());
+        if synced.as_deref() == Some(new.as_str()) {
+            continue;
+        }
+        let wt = root.join(&rel);
+        let current = if wt.is_file() { Some(hash_file(&wt)?) } else { None };
+        if current.as_deref() == Some(new.as_str()) {
+            continue;
+        }
+        if current != synced {
+            out.push((rel, false));
+            continue;
+        }
+        let tmp = wt.with_file_name(format!(".Cargo.lock.cargo-slot-{}", std::process::id()));
+        let mut f = File::options().write(true).create_new(true).open(&tmp)?;
+        std::io::copy(&mut File::open(&mirrored)?, &mut f)?;
+        drop(f);
+        if let Ok(m) = fs::metadata(&wt) {
+            fs::set_permissions(&tmp, m.permissions())?;
+        }
+        fs::rename(&tmp, &wt)?;
+        out.push((rel, true));
+    }
+    Ok(out)
 }
 
-fn hash_file(p: &Path) -> Result<String> {
+pub fn hash_file(p: &Path) -> Result<String> {
     Ok(blake3::Hasher::new().update_reader(File::open(p)?)?.finalize().to_hex().to_string())
 }
 
@@ -543,6 +587,33 @@ mod tests {
         fs::set_permissions(e.dst.join("run.sh"), Permissions::from_mode(0o600)).unwrap();
         e.sync(&["run.sh"]);
         assert_eq!(fs::metadata(e.dst.join("run.sh")).unwrap().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn lock_write_back_respects_worktree_edits() {
+        let mut e = Env::new();
+        e.write("Cargo.lock", "v1");
+        e.write("sub/Cargo.lock", "s1");
+        e.sync(&["Cargo.lock", "sub/Cargo.lock"]);
+        // Cargo changes both in the slot; meanwhile the user edits one.
+        fs::write(e.dst.join("Cargo.lock"), "v2").unwrap();
+        fs::write(e.dst.join("sub/Cargo.lock"), "s2").unwrap();
+        e.write("sub/Cargo.lock", "user");
+        let out = write_back_locks(&e.src, &e.dst, Path::new(""), &e.manifest).unwrap();
+        assert_eq!(out, [("Cargo.lock".to_string(), true), ("sub/Cargo.lock".to_string(), false)]);
+        assert_eq!(fs::read_to_string(e.src.join("Cargo.lock")).unwrap(), "v2");
+        assert_eq!(fs::read_to_string(e.src.join("sub/Cargo.lock")).unwrap(), "user");
+    }
+
+    #[test]
+    fn new_lockfile_written_back_from_cwd_ancestors() {
+        let e = Env::new();
+        fs::create_dir_all(e.src.join("crates/a")).unwrap();
+        fs::create_dir_all(e.dst.join("crates/a")).unwrap();
+        fs::write(e.dst.join("Cargo.lock"), "new").unwrap();
+        let out = write_back_locks(&e.src, &e.dst, Path::new("crates/a"), &Manifest::new()).unwrap();
+        assert_eq!(out, [("Cargo.lock".to_string(), true)]);
+        assert_eq!(fs::read_to_string(e.src.join("Cargo.lock")).unwrap(), "new");
     }
 
     #[test]

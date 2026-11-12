@@ -6,6 +6,8 @@
 #
 # Each worktree starts at a different recent commit. After the first build
 # of each, every round edits one file per worktree and rebuilds them all.
+# Round 1 is reported apart from later rounds: it includes one-time costs
+# such as the first rebuild in a freshly cloned slot.
 # Reports wall time, CPU time (user+sys, includes rustc) and disk. "disk" is
 # du (counts copy-on-write clones in full); "phys" is the change in used
 # space on the volume, which counts shared blocks once but picks up noise
@@ -54,10 +56,14 @@ run() { # $1 = strategy name, rest = build command
   for i in $(seq 1 "$N"); do (cd "$WORK/$name-$i" && timed "$@"); done
   local first=$(awk '{w+=$1; c+=$2} END{printf "%.1f %.1f", w, c}' "$WORK/times")
   : >"$WORK/times"
-  for r in $(seq 1 "$ROUNDS"); do
+  for i in $(seq 1 "$N"); do edit "$WORK/$name-$i" 1; (cd "$WORK/$name-$i" && timed "$@"); done
+  local round1=$(awk '{c+=$2} END{printf "%.1f", c}' "$WORK/times")
+  : >"$WORK/times"
+  for r in $(seq 2 "$ROUNDS"); do
     for i in $(seq 1 "$N"); do edit "$WORK/$name-$i" "$r"; (cd "$WORK/$name-$i" && timed "$@"); done
   done
-  local rounds=$(awk '{w+=$1; c+=$2} END{printf "%.1f %.1f", w, c}' "$WORK/times")
+  # CPU per round, averaged over rounds 2..ROUNDS.
+  local later=$(awk -v n=$((ROUNDS - 1)) '{c+=$2} END{printf "%.1f", n ? c/n : 0}' "$WORK/times")
   local disk
   if [ "$name" = plain ]; then
     disk=$(du -sk "$WORK"/plain-*/target | awk '{s+=$1} END{printf "%.0f", s/1024}')
@@ -65,8 +71,8 @@ run() { # $1 = strategy name, rest = build command
     disk=$(du -sk "$CARGO_SLOT_HOME" | awk '{printf "%.0f", $1/1024}')
   fi
   sync; local phys=$(df -k "$WORK" | awk -v u0="$used0" 'NR==2{printf "%.0f", ($3-u0)/1024}')
-  printf "%-7s first builds: %6ss wall %7ss cpu | edit rounds: %6ss wall %7ss cpu | disk %5s MB  phys %5s MB\n" \
-    "$name" ${first% *} ${first#* } ${rounds% *} ${rounds#* } "$disk" "$phys"
+  printf "%-7s first builds: %6ss wall %7ss cpu | edit round 1: %6ss cpu | later rounds: %6ss cpu/round | disk %5s MB  phys %5s MB\n" \
+    "$name" ${first% *} ${first#* } "$round1" "$later" "$disk" "$phys"
 }
 
 echo "repo: $REPO  worktrees: $N  rounds: $ROUNDS"

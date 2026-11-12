@@ -7,12 +7,14 @@ use std::process::{Command, Output};
 
 struct Fixture {
     _tmp: tempfile::TempDir,
-    base: PathBuf,
+    /// Parent of all worktrees. Not above the slot cache, so configs and
+    /// sibling crates here are only reachable the way a worktree sees them.
+    work: PathBuf,
     main: PathBuf,
     home: PathBuf,
 }
 
-fn git(dir: &Path, args: &[&str]) {
+fn git_out(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
         .args(args)
@@ -20,6 +22,11 @@ fn git(dir: &Path, args: &[&str]) {
         .output()
         .unwrap();
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    git_out(dir, args);
 }
 
 fn write(p: impl AsRef<Path>, body: &str) {
@@ -33,7 +40,8 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
-        let main = base.join("main");
+        let work = base.join("work");
+        let main = work.join("main");
         write(main.join("Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
         write(main.join("src/main.rs"), "mod util;\nfn main() { println!(\"{}\", util::msg()); }\n");
         write(main.join("src/util.rs"), "pub fn msg() -> &'static str { \"v1\" }\n");
@@ -42,26 +50,30 @@ impl Fixture {
         git(&main, &["add", "-A"]);
         git(&main, &["commit", "-qm", "init"]);
         let home = base.join("cache");
-        Fixture { _tmp: tmp, base, main, home }
+        Fixture { _tmp: tmp, work, main, home }
     }
 
     fn worktree(&self, name: &str) -> PathBuf {
-        let p = self.base.join(name);
+        let p = self.work.join(name);
         git(&self.main, &["worktree", "add", "-q", p.to_str().unwrap(), "-b", name]);
         p
     }
 
     fn slot(&self, args: &[&str], dir: &Path) -> Output {
-        let out = Command::new(env!("CARGO_BIN_EXE_cargo-slot"))
+        let out = self.slot_raw(args, dir);
+        assert!(out.status.success(), "cargo slot {args:?} failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        out
+    }
+
+    fn slot_raw(&self, args: &[&str], dir: &Path) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_cargo-slot"))
             .args(args)
             .current_dir(dir)
             .env("CARGO_SLOT_HOME", &self.home)
             .env("CARGO_SLOT_MAX", "2")
             .env_remove("CARGO_TARGET_DIR")
             .output()
-            .unwrap();
-        assert!(out.status.success(), "cargo slot {args:?} failed:\n{}", String::from_utf8_lossy(&out.stderr));
-        out
+            .unwrap()
     }
 
     fn build(&self, dir: &Path) -> String {
@@ -102,12 +114,7 @@ fn worktree_switch_reuses_build() {
 fn error_paths_point_at_worktree() {
     let f = Fixture::new();
     write(f.main.join("src/util.rs"), "pub fn msg() -> &'static str { 1 }\n");
-    let out = Command::new(env!("CARGO_BIN_EXE_cargo-slot"))
-        .args(["build", "--message-format=short"])
-        .current_dir(&f.main)
-        .env("CARGO_SLOT_HOME", &f.home)
-        .output()
-        .unwrap();
+    let out = f.slot_raw(&["build", "--message-format=short"], &f.main);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(err.contains("src/util.rs:1"), "{err}");
@@ -140,7 +147,7 @@ fn dir_replaced_by_symlink_does_not_escape() {
     fs::write(&victim, "victim").unwrap();
     // `a/x` resolves through the symlink to a real file (from the worktree,
     // `../target` is outside the repo; from the slot, it is the slot's target).
-    write(f.base.join("target/x"), "attacker");
+    write(f.work.join("target/x"), "attacker");
     fs::remove_dir_all(f.main.join("a")).unwrap();
     symlink("../target", f.main.join("a")).unwrap();
     // Leaves sync in parallel, so give any ordering race a few chances.
@@ -188,4 +195,140 @@ fn concurrent_builds_use_separate_slots() {
     assert!(f.slot_dir(1).is_dir() && f.slot_dir(2).is_dir());
     // Slot affinity: main goes back to the slot it built in, which is fresh.
     assert!(!compiled(&f.build(&f.main)));
+}
+
+#[test]
+fn source_editing_commands_run_in_worktree() {
+    let f = Fixture::new();
+    write(f.main.join("src/util.rs"), "pub fn msg()->&'static str{\"v1\"}\n");
+    let err = String::from_utf8(f.slot(&["fmt"], &f.main).stderr).unwrap();
+    assert!(err.contains("running plain cargo"), "{err}");
+    assert_eq!(fs::read_to_string(f.main.join("src/util.rs")).unwrap(), "pub fn msg() -> &'static str {\n    \"v1\"\n}\n");
+    assert!(!f.home.exists() || fs::read_dir(&f.home).unwrap().next().is_none(), "fmt should not touch slots");
+}
+
+#[test]
+fn lockfile_changes_are_written_back() {
+    let f = Fixture::new();
+    f.build(&f.main);
+    git(&f.main, &["add", "Cargo.lock"]);
+    git(&f.main, &["commit", "-qm", "lock"]);
+    // New path dependency: cargo rewrites Cargo.lock during the slot build.
+    write(f.main.join("dep/Cargo.toml"), "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write(f.main.join("dep/src/lib.rs"), "");
+    let toml = fs::read_to_string(f.main.join("Cargo.toml")).unwrap();
+    write(f.main.join("Cargo.toml"), &format!("{toml}\n[dependencies]\ndep = {{ path = \"dep\" }}\n"));
+    let err = f.build(&f.main);
+    assert!(err.contains("updated Cargo.lock in the worktree"), "{err}");
+    assert!(fs::read_to_string(f.main.join("Cargo.lock")).unwrap().contains("name = \"dep\""));
+    assert!(!f.build(&f.main).contains("updated Cargo.lock"), "no write-back when nothing changed");
+}
+
+#[test]
+fn ignored_lockfile_is_kept() {
+    let f = Fixture::new();
+    write(f.main.join(".gitignore"), "/target\n/Cargo.lock\n");
+    git(&f.main, &["commit", "-qam", "ignore lock"]);
+    // Plain cargo would create the lockfile in the worktree; so do we.
+    f.build(&f.main);
+    let lock = f.main.join("Cargo.lock");
+    assert!(lock.is_file());
+    let before = fs::metadata(&lock).unwrap().modified().unwrap();
+    let err = f.build(&f.main);
+    assert!(err.contains("0 changed, 0 removed"), "{err}");
+    assert!(f.slot_dir(1).join("src/Cargo.lock").is_file());
+    assert_eq!(fs::metadata(&lock).unwrap().modified().unwrap(), before);
+}
+
+#[test]
+fn include_env_mirrors_extra_ignored_files() {
+    let f = Fixture::new();
+    write(f.main.join("secret.env"), "s");
+    let out = Command::new(env!("CARGO_BIN_EXE_cargo-slot"))
+        .args(["build"])
+        .current_dir(&f.main)
+        .env("CARGO_SLOT_HOME", &f.home)
+        .env("CARGO_SLOT_INCLUDE", "secret.env")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(f.slot_dir(1).join("src/secret.env").is_file());
+}
+
+#[test]
+fn sibling_path_deps_and_parent_configs() {
+    let f = Fixture::new();
+    write(f.work.join("other/Cargo.toml"), "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write(f.work.join("other/src/lib.rs"), "pub fn x() -> &'static str { \"other\" }\n");
+    write(f.work.join(".cargo/config.toml"), "[env]\nFROM_PARENT = \"parent-config\"\n");
+    let toml = fs::read_to_string(f.main.join("Cargo.toml")).unwrap();
+    write(f.main.join("Cargo.toml"), &format!("{toml}\n[dependencies]\nother = {{ path = \"../other\" }}\n"));
+    write(f.main.join("src/main.rs"), "fn main() { println!(\"{} {}\", other::x(), env!(\"FROM_PARENT\")); }\n");
+    let out = f.slot(&["run", "-q"], &f.main);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "other parent-config");
+    // The sibling builds from its real location: edits there are picked up.
+    write(f.work.join("other/src/lib.rs"), "pub fn x() -> &'static str { \"edited\" }\n");
+    let out = f.slot(&["run", "-q"], &f.main);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "edited parent-config");
+}
+
+#[test]
+fn deep_path_deps_fail_clearly() {
+    let f = Fixture::new();
+    let toml = fs::read_to_string(f.main.join("Cargo.toml")).unwrap();
+    write(f.main.join("Cargo.toml"), &format!("{toml}\n[dependencies]\nx = {{ path = \"../../x\" }}\n"));
+    let out = f.slot_raw(&["build"], &f.main);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("more than one level above the repo"));
+}
+
+#[test]
+fn slot_git_is_isolated_from_worktree() {
+    let f = Fixture::new();
+    let head = git_out(&f.main, &["rev-parse", "HEAD"]);
+    write(f.main.join("src/util.rs"), "pub fn msg() -> &'static str { \"dirty\" }\n");
+    f.build(&f.main);
+    let src = f.slot_dir(1).join("src");
+    let index = fs::read(f.main.join(".git/index")).unwrap();
+    let status = git_out(&f.main, &["status", "--porcelain"]);
+
+    // The slot's git sees the same commit and dirty state.
+    assert_eq!(git_out(&src, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git_out(&src, &["status", "--porcelain"]), status);
+    // What a build script does to git stays in the slot.
+    git(&src, &["add", "-A"]);
+    git(&src, &["commit", "-qm", "from a build script"]);
+    assert_eq!(fs::read(f.main.join(".git/index")).unwrap(), index, "worktree index changed");
+    assert_eq!(git_out(&f.main, &["rev-parse", "HEAD"]), head, "worktree branch moved");
+    assert_eq!(git_out(&f.main, &["status", "--porcelain"]), status);
+
+    // Next build resets the slot to the worktree's commit.
+    f.build(&f.main);
+    assert_eq!(git_out(&src, &["rev-parse", "HEAD"]), head);
+
+    // GC removes the registration.
+    f.slot(&["clean"], &f.main);
+    assert!(!git_out(&f.main, &["worktree", "list"]).contains("slot-1"));
+}
+
+#[test]
+fn toolchain_override() {
+    if Command::new("rustup").arg("--version").output().is_err() {
+        eprintln!("skipping: no rustup");
+        return;
+    }
+    let f = Fixture::new();
+    let out = f.slot(&["+stable", "run", "-q"], &f.main);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1");
+    let out = f.slot(&["+stable", "-v", "build"], &f.main);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("synced"), "should build in a slot");
+}
+
+#[test]
+fn gc_rejects_bad_args() {
+    let f = Fixture::new();
+    let out = f.slot_raw(&["gc", "--keep", "abc"], &f.main);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("expects a number"));
+    assert!(!f.slot_raw(&["gc", "--bogus"], &f.main).status.success());
 }

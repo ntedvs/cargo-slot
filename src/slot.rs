@@ -38,6 +38,9 @@ pub struct Info {
     pub head: String,
     /// Unix seconds of last use.
     pub last_used: u64,
+    /// This slot's linked-worktree admin dir under `.git/worktrees`.
+    #[serde(default)]
+    pub git_admin: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -187,8 +190,17 @@ impl Store {
             }
 
             if (ids.len() as u32) < max.max(1) {
-                let id = ids.iter().max().map_or(1, |m| m + 1);
-                let slot = self.try_lock(id)?.context("fresh slot lock is held")?;
+                // Lowest free id. A waiter may briefly hold the lock of a
+                // slot GC just deleted, so skip ids whose lock is taken.
+                let mut id = 1;
+                let slot = loop {
+                    if !ids.contains(&id)
+                        && let Some(s) = self.try_lock(id)?
+                    {
+                        break s;
+                    }
+                    id += 1;
+                };
                 fs::create_dir(&slot.dir)?;
                 // Keep an idle source locked so it's stable while cloning.
                 let source = idle.into_iter().next().map(|(_, s)| s);
@@ -235,6 +247,9 @@ impl Store {
         for id in ids.into_iter().skip(keep) {
             match self.try_lock(id)? {
                 Some(s) => {
+                    if let Some(admin) = s.info().git_admin {
+                        remove_git_admin(&admin);
+                    }
                     fs::remove_dir_all(&s.dir)?;
                     out.push((id, true));
                 }
@@ -246,6 +261,39 @@ impl Store {
 }
 
 impl Slot {
+    /// Name for this slot's git worktree registration.
+    pub fn git_name(&self) -> String {
+        let store = self.dir.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+        format!("cargo-slot-{}-{}", store.unwrap_or_default(), self.id)
+    }
+
+    /// Point `<slot>/<name>` at `<real_parent>/<name>` for each name, so
+    /// `../<name>` from the mirror reaches the same directory it does from
+    /// the worktree. Removes links that are no longer needed.
+    pub fn link_siblings(&self, names: &std::collections::BTreeSet<String>, real_parent: &Path) -> Result<()> {
+        const OWN: &[&str] = &["src", "src.staging", "target", "info.json", "manifest.json", "lock"];
+        for e in fs::read_dir(&self.dir)?.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.file_type()?.is_symlink() && !names.contains(&name) {
+                fs::remove_file(e.path())?;
+            }
+        }
+        for name in names {
+            if OWN.contains(&name.as_str()) || name.ends_with(".tmp") {
+                anyhow::bail!("path dependency ../{name} collides with cargo-slot's own `{name}` in the slot");
+            }
+            let link = self.dir.join(name);
+            let target = real_parent.join(name);
+            if fs::read_link(&link).ok().as_deref() == Some(target.as_path()) {
+                continue;
+            }
+            if fs::symlink_metadata(&link).is_ok() {
+                fs::remove_file(&link)?;
+            }
+            std::os::unix::fs::symlink(&target, &link)?;
+        }
+        Ok(())
+    }
     pub fn src(&self) -> PathBuf {
         self.dir.join("src")
     }
@@ -266,6 +314,16 @@ impl Slot {
 
 fn open_lock(p: &Path) -> Result<File> {
     Ok(fs::OpenOptions::new().create(true).truncate(false).write(true).open(p)?)
+}
+
+/// Remove a slot's `.git/worktrees/<name>` entry, but only if it is one of
+/// ours.
+fn remove_git_admin(admin: &Path) {
+    let ours = admin.file_name().is_some_and(|n| n.to_string_lossy().starts_with("cargo-slot-"))
+        && admin.parent().and_then(|p| p.file_name()).is_some_and(|n| n == "worktrees");
+    if ours {
+        let _ = fs::remove_dir_all(admin);
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Option<T> {
@@ -313,7 +371,6 @@ mod tests {
     fn fake_repo(root: &Path) -> Repo {
         Repo {
             root: root.to_path_buf(),
-            git_dir: root.join(".git"),
             common_dir: root.join(".git"),
             head: String::new(),
             cwd_rel: PathBuf::new(),

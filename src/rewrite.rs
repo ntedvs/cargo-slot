@@ -67,4 +67,49 @@ mod tests {
         pipe(input, &mut out, b"/slot/src", b"/wt");
         assert_eq!(out, b"err at /wt/main.rs and /wt/x");
     }
+
+    fn run(chunks: &[&[u8]], pat: &[u8], rep: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        pipe(Chunks(chunks.iter().map(|c| c.to_vec()).collect()), &mut out, pat, rep);
+        out
+    }
+
+    #[test]
+    fn passes_through_without_matches() {
+        assert_eq!(run(&[b"hello ", b"world"], b"/slot", b"/wt"), b"hello world");
+        assert_eq!(run(&[], b"/slot", b"/wt"), b"");
+    }
+
+    #[test]
+    fn partial_match_at_eof_is_flushed() {
+        assert_eq!(run(&[b"ends with /sl"], b"/slot", b"/wt"), b"ends with /sl");
+    }
+
+    #[test]
+    fn adjacent_and_repeated_matches() {
+        assert_eq!(run(&[b"/slot/slot", b"/slot"], b"/slot", b"/wt"), b"/wt/wt/wt");
+    }
+
+    #[test]
+    fn one_byte_chunks() {
+        let input = b"a /slot/src b /slot/src";
+        let chunks: Vec<&[u8]> = input.chunks(1).collect();
+        assert_eq!(run(&chunks, b"/slot/src", b"/wt"), b"a /wt b /wt");
+    }
+
+    #[test]
+    fn false_start_inside_partial_match() {
+        // `//slot` contains a false start: the first `/` begins a partial match.
+        assert_eq!(run(&[b"x//sl", b"ot"], b"/slot", b"/wt"), b"x//wt");
+    }
+
+    #[test]
+    fn replacement_may_contain_pattern() {
+        assert_eq!(run(&[b"/a/a"], b"/a", b"/a/a"), b"/a/a/a/a");
+    }
+
+    #[test]
+    fn non_utf8_passes_through() {
+        assert_eq!(run(&[b"\xff/slot\xfe"], b"/slot", b"/wt"), b"\xff/wt\xfe");
+    }
 }

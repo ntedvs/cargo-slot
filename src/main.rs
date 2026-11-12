@@ -1,12 +1,19 @@
+#[cfg(not(unix))]
+compile_error!("cargo-slot supports Unix (macOS, Linux) only");
+
+mod cli;
+mod external;
 mod git;
 mod rewrite;
 mod slot;
 mod sync;
+mod term;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use cli::Mode;
 use std::ffi::OsString;
-use std::io::IsTerminal;
-use std::process::{Command, ExitCode, Stdio};
+use std::io::{IsTerminal, Read};
+use std::process::{Command, ExitCode, ExitStatus};
 use std::time::Instant;
 
 const HELP: &str = "\
@@ -20,13 +27,18 @@ Usage:
 
 Each repo gets a small pool of slots. A slot is a mirror of a worktree at a
 fixed path, plus its own target dir. Before building, your worktree is synced
-into the best idle slot, copying only changed files. Cargo then sees the same
-paths and mtimes as last time and rebuilds only what actually changed, no
-matter which worktree built last.
+into a slot, copying only changed files. Cargo then sees the same paths and
+mtimes as last time and rebuilds only what actually changed.
+
+Commands that edit source files (fmt, fix, clippy --fix, add, remove,
+update, ...) run as plain cargo in the worktree instead. Lockfile changes
+cargo makes during a slot build are copied back to the worktree.
 
 Env:
-  CARGO_SLOT_MAX    Max slots per repo (default 4)
-  CARGO_SLOT_HOME   Where slots live (default ~/.cache/cargo-slot)
+  CARGO_SLOT_MAX      Max slots per repo (default 4)
+  CARGO_SLOT_HOME     Where slots live (default ~/.cache/cargo-slot)
+  CARGO_SLOT_INCLUDE  Extra gitignored files to mirror, comma-separated
+                      git globs, e.g. `.env,config/*.local.toml`
 ";
 
 fn main() -> ExitCode {
@@ -44,6 +56,7 @@ fn run() -> Result<u8> {
     if args.first().is_some_and(|a| a == "slot") {
         args.remove(0);
     }
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     match args.first().map(String::as_str) {
         None | Some("help" | "-h" | "--help") => {
             print!("{HELP}");
@@ -51,14 +64,20 @@ fn run() -> Result<u8> {
         }
         Some("status") => status().map(|_| 0),
         Some("gc") => {
-            let keep = match args.get(1).map(String::as_str) {
-                Some("--keep") => args.get(2).and_then(|n| n.parse().ok()).unwrap_or_else(max_slots),
-                _ => max_slots(),
+            let keep = match rest.as_slice() {
+                [] => max_slots(),
+                ["--keep", n] => n.parse().with_context(|| format!("--keep expects a number, got {n:?}"))?,
+                _ => bail!("usage: cargo slot gc [--keep N]"),
             };
             gc(keep as usize).map(|_| 0)
         }
-        Some("clean") => gc(0).map(|_| 0),
-        _ => build(&args),
+        Some("clean") => {
+            if !rest.is_empty() {
+                bail!("usage: cargo slot clean");
+            }
+            gc(0).map(|_| 0)
+        }
+        _ => cargo(&args),
     }
 }
 
@@ -66,7 +85,23 @@ fn max_slots() -> u32 {
     std::env::var("CARGO_SLOT_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
 }
 
-fn build(args: &[String]) -> Result<u8> {
+fn cargo(args: &[String]) -> Result<u8> {
+    let parsed = cli::parse(args);
+    let quiet = args.iter().any(|a| a == "-q" || a == "--quiet" || a.starts_with("--message-format"));
+    // With `+toolchain`, go through the rustup proxy on PATH; `$CARGO` is a
+    // concrete toolchain's cargo and doesn't understand `+`.
+    let cargo_bin = match (parsed.toolchain, std::env::var_os("CARGO")) {
+        (None, Some(c)) => c,
+        _ => OsString::from("cargo"),
+    };
+
+    if parsed.mode == Mode::Worktree {
+        if let (Some(sub), false) = (parsed.subcommand, quiet) {
+            eprintln!("cargo-slot: `{sub}` edits the worktree, running plain cargo there");
+        }
+        return Ok(code(Command::new(cargo_bin).args(args).status()?));
+    }
+
     let repo = git::Repo::discover()?;
     let store = slot::Store::open(&repo)?;
     let slot = store.acquire(&repo, max_slots())?;
@@ -76,14 +111,17 @@ fn build(args: &[String]) -> Result<u8> {
     let mut manifest = slot.manifest();
     let same_origin = info.origin.as_deref() == Some(repo.root.as_path());
     let files = repo.files()?;
+    let siblings = external::sibling_deps(&repo.root, &files)?;
     let stats = sync::sync(&repo.root, &files, &slot.src(), &mut manifest, same_origin)?;
-    sync::write_git_pointer(&repo.git_dir, &slot.src())?;
+    if let Some(parent) = repo.root.parent() {
+        slot.link_siblings(&siblings, parent)?;
+    }
+    info.git_admin = repo.link_slot(&slot.src(), &slot.git_name())?;
     info.origin = Some(repo.root.clone());
     info.head = repo.head.clone();
     info.last_used = slot::now();
     slot.save(&info, &manifest)?;
 
-    let quiet = args.iter().any(|a| a == "-q" || a == "--quiet" || a.starts_with("--message-format"));
     if !quiet {
         eprintln!(
             "cargo-slot: slot {} synced {} files ({} changed, {} removed) in {:.0?}",
@@ -95,43 +133,70 @@ fn build(args: &[String]) -> Result<u8> {
         );
     }
 
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut cmd = Command::new(cargo);
-    cmd.args(args)
+    // Cargo configs above the repo aren't above the slot; pass them along.
+    let mut full: Vec<OsString> = Vec::new();
+    let mut user = args;
+    if parsed.toolchain.is_some() {
+        full.push(args[0].clone().into());
+        user = &args[1..];
+    }
+    for cfg in external::parent_configs(&repo.root, &slot.src()) {
+        if cfg.extension().is_some_and(|e| e == "toml") {
+            full.push("--config".into());
+            full.push(cfg.into_os_string());
+        } else {
+            eprintln!("cargo-slot: warning: ignoring {}; rename it to config.toml to use it from a slot", cfg.display());
+        }
+    }
+    full.extend(user.iter().map(OsString::from));
+
+    let mut cmd = Command::new(cargo_bin);
+    cmd.args(&full)
         .current_dir(slot.src().join(&repo.cwd_rel))
         .env("CARGO_TARGET_DIR", slot.target())
         .env("CARGO_SLOT_WORKTREE", &repo.root);
 
-    // Output is piped for path rewriting, so keep cargo's tty niceties.
-    if std::io::stderr().is_terminal() {
-        if std::env::var_os("CARGO_TERM_COLOR").is_none() {
-            cmd.env("CARGO_TERM_COLOR", "always");
-        }
-        if std::env::var_os("CARGO_TERM_PROGRESS_WHEN").is_none() {
-            cmd.env("CARGO_TERM_PROGRESS_WHEN", "always");
-            if let Some((w, _)) = terminal_size::terminal_size_of(std::io::stderr()) {
-                cmd.env("CARGO_TERM_PROGRESS_WIDTH", w.0.to_string());
-            }
-        }
-    }
-
-    // `cargo run` hands the terminal to the user's program, so don't pipe it.
-    let interactive = args.first().is_some_and(|a| a == "run" || a == "r");
-    let status = if interactive {
+    let status = if parsed.mode == Mode::Interactive {
+        // `cargo run` hands the terminal to the user's program untouched.
         cmd.status()?
     } else {
-        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let (out_stdio, out_pty) = term::output(std::io::stdout().is_terminal())?;
+        let (err_stdio, err_pty) = term::output(std::io::stderr().is_terminal())?;
+        cmd.stdout(out_stdio).stderr(err_stdio);
+        let mut child = cmd.spawn()?;
+        // Close our copies of the pty child ends, or reads never see EOF.
+        drop(cmd);
+        let out: Box<dyn Read + Send> = match out_pty {
+            Some(f) => Box::new(f),
+            None => Box::new(child.stdout.take().unwrap()),
+        };
+        let err: Box<dyn Read + Send> = match err_pty {
+            Some(f) => Box::new(f),
+            None => Box::new(child.stderr.take().unwrap()),
+        };
         let from = slot.src().to_string_lossy().into_owned().into_bytes();
         let to = repo.root.to_string_lossy().into_owned().into_bytes();
-        let out = child.stdout.take().unwrap();
-        let err = child.stderr.take().unwrap();
         std::thread::scope(|s| {
             s.spawn(|| rewrite::pipe(out, std::io::stdout().lock(), &from, &to));
             s.spawn(|| rewrite::pipe(err, std::io::stderr().lock(), &from, &to));
         });
         child.wait()?
     };
-    Ok(status.code().map_or(101, |c| c.clamp(0, 255) as u8))
+
+    for (rel, written) in sync::write_back_locks(&repo.root, &slot.src(), &repo.cwd_rel, &manifest)? {
+        if written {
+            if !quiet {
+                eprintln!("cargo-slot: updated {rel} in the worktree");
+            }
+        } else {
+            eprintln!("cargo-slot: warning: {rel} changed in both the worktree and the build; kept the worktree's copy");
+        }
+    }
+    Ok(code(status))
+}
+
+fn code(status: ExitStatus) -> u8 {
+    status.code().map_or(101, |c| c.clamp(0, 255) as u8)
 }
 
 fn status() -> Result<()> {
@@ -143,11 +208,7 @@ fn status() -> Result<()> {
         let origin = s.info.origin.map_or("-".into(), |p| p.display().to_string());
         let head = s.info.head.get(..8).unwrap_or("-");
         let ago = if s.info.last_used == 0 { "never".into() } else { fmt_ago(now.saturating_sub(s.info.last_used)) };
-        println!(
-            "  slot {}  {:<4}  {head:<8}  {ago:>6}  {origin}",
-            s.id,
-            if s.busy { "busy" } else { "idle" },
-        );
+        println!("  slot {}  {:<4}  {head:<8}  {ago:>6}  {origin}", s.id, if s.busy { "busy" } else { "idle" });
     }
     Ok(())
 }
