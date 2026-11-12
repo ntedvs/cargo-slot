@@ -216,7 +216,6 @@ impl Store {
             match self.try_lock(id)? {
                 Some(s) => {
                     fs::remove_dir_all(&s.dir)?;
-                    fs::remove_file(self.lock_path(id)).ok();
                     out.push((id, true));
                 }
                 None => out.push((id, false)),
@@ -315,6 +314,21 @@ mod tests {
         assert_eq!(out.iter().filter(|(_, r)| *r).count(), 1);
         assert!(a.dir.is_dir());
         assert!(store.lock_path(1).exists() && store.lock_path(2).exists());
+    }
+
+    #[test]
+    fn lock_identity_survives_gc() {
+        // A waiter opens the slot lock, then GC deletes the slot and a new
+        // holder recreates it. The waiter's handle must still conflict.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().join("store")).unwrap();
+        let repo = fake_repo(tmp.path());
+        drop(store.acquire(&repo, 1).unwrap());
+        let waiter = open_lock(&store.lock_path(1)).unwrap();
+        assert_eq!(store.gc(0).unwrap(), vec![(1, true)]);
+        let holder = store.acquire(&repo, 1).unwrap();
+        assert_eq!(holder.id, 1);
+        assert!(matches!(waiter.try_lock(), Err(TryLockError::WouldBlock)));
     }
 
     #[test]
