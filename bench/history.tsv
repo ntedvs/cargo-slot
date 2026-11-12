@@ -1,0 +1,4 @@
+date	rev	os	fs	cores	strategy	first_wall	first_cpu	round1_cpu	later_cpu	disk_mb	phys_mb
+2026-11-12	d1a69c9	Linux x86_64	btrfs (loopback)	4	plain	51.9	172.6	25.4	25.5	1156	1175
+2026-11-12	d1a69c9	Linux x86_64	btrfs (loopback)	4	slot-1	23.7	63.0	37.2	35.3	301	317
+2026-11-12	d1a69c9	Linux x86_64	btrfs (loopback)	4	slot-n	23.4	61.5	25.2	25.3	1440	580
