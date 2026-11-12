@@ -148,9 +148,11 @@ impl Store {
     }
 
     /// Lower is better: how much work reusing slot `id` would take.
+    /// A slot this worktree used last is best whatever its commit, since it
+    /// also holds the worktree's uncommitted edits.
     fn score(&self, id: u32, repo: &Repo) -> u64 {
         let info = self.info(id);
-        if info.origin.as_deref() == Some(repo.root.as_path()) && info.head == repo.head {
+        if info.origin.as_deref() == Some(repo.root.as_path()) {
             return 0;
         }
         match repo.distance(&info.head) {
@@ -159,7 +161,12 @@ impl Store {
         }
     }
 
-    /// Pick the best slot for this worktree, creating or waiting as needed.
+    /// Pick a slot for this worktree:
+    /// 1. its own idle slot;
+    /// 2. else, under `max`, a new slot cloned (copy-on-write) from the
+    ///    closest one, so worktrees don't thrash each other's state;
+    /// 3. else the closest idle slot;
+    /// 4. else wait for the closest busy one.
     pub fn acquire(&self, repo: &Repo, max: u32) -> Result<Slot> {
         loop {
             let guard = self.store_lock()?;
@@ -172,23 +179,31 @@ impl Store {
                     None => busy.push((self.score(id, repo), id)),
                 }
             }
+            idle.sort_by_key(|(s, slot)| (*s, slot.id));
+            busy.sort();
 
-            if !idle.is_empty() {
-                idle.sort_by_key(|(s, slot)| (*s, slot.id));
-                return Ok(idle.into_iter().next().unwrap().1);
+            if idle.first().is_some_and(|(s, _)| *s == 0) {
+                return Ok(idle.swap_remove(0).1);
             }
 
-            busy.sort();
             if (ids.len() as u32) < max.max(1) {
                 let id = ids.iter().max().map_or(1, |m| m + 1);
                 let slot = self.try_lock(id)?.context("fresh slot lock is held")?;
                 fs::create_dir(&slot.dir)?;
+                // Keep an idle source locked so it's stable while cloning.
+                let source = idle.into_iter().next().map(|(_, s)| s);
+                let from = source.as_ref().map(|s| s.id).or(busy.first().map(|b| b.1));
                 drop(guard);
-                if let Some(&(_, from)) = busy.first() {
-                    eprintln!("cargo-slot: all slots busy, cloning slot {from} into slot {id}");
+                if let Some(from) = from {
+                    let started = std::time::Instant::now();
                     clone_slot(&self.slot_dir(from), &slot.dir)?;
+                    eprintln!("cargo-slot: new slot {id} cloned from slot {from} in {:.0?}", started.elapsed());
                 }
                 return Ok(slot);
+            }
+
+            if !idle.is_empty() {
+                return Ok(idle.swap_remove(0).1);
             }
 
             let (_, id) = busy[0];

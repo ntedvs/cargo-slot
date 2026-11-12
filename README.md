@@ -26,19 +26,42 @@ A slot is a mirror of a worktree at a fixed path, plus its own target dir.
 
 On `cargo slot <args>`:
 
-1. Pick the idle slot that needs the least work (same worktree first, then
-   fewest files changed between commits).
-2. Sync your worktree into it. Only files whose content changed are written.
-   Everything else keeps its mtime, so cargo's fingerprints stay fresh.
+1. Pick a slot: this worktree's own idle slot if it has one. Otherwise,
+   below `CARGO_SLOT_MAX`, a new slot cloned copy-on-write (APFS clonefile,
+   or reflinks on btrfs/XFS) from the closest slot, so dependencies are
+   reused without duplicating disk. At the max, the closest idle slot
+   (fewest files changed between commits), or wait for one.
+2. Sync your worktree into it. The slot ends up holding exactly the files
+   git lists, with matching contents and permissions. Only changed files
+   are written; everything else keeps its mtime, so cargo's fingerprints
+   stay fresh. Files a build created in the slot are removed.
 3. Run cargo there. Paths in output are rewritten back to your worktree so
    errors are still clickable.
 
-So switching worktrees costs only what actually differs. If every slot is busy,
-a new one is made as a copy-on-write clone of the closest slot (APFS clonefile,
-or reflinks on btrfs/XFS), so dependencies are reused without using more disk.
-At the max, it waits for a slot.
-
 Disk usage is bounded by the slot count, not the worktree count.
+
+## Benchmark
+
+`bench/worktrees.sh <repo> [worktrees] [rounds] [edit-file]` checks out
+worktrees at different recent commits, builds each, then for each round
+edits one file per worktree and rebuilds all of them in turn.
+
+ripgrep (60 crates), 5 worktrees, 3 rounds, editing
+`crates/searcher/src/lib.rs`, debug builds, M-series Mac, APFS:
+
+| | first builds (CPU) | edit rounds (CPU) | disk (physical) |
+|---|---|---|---|
+| plain `cargo build` | 124s | 25s | 1586 MB |
+| `cargo slot`, `CARGO_SLOT_MAX=1` | 45s | 63s | 782 MB |
+| `cargo slot`, `CARGO_SLOT_MAX=5` | 55s | 33s | 1071 MB |
+
+One slot per worktree (the default up to the max) cuts first-build CPU by
+about 55% and disk by about 30%. Edits cost about the same as plain cargo
+once warm; the extra in the table is a one-time slowdown on the first
+rebuild after a clone. A single shared slot is cheapest on disk but
+thrashes when worktrees sit at different commits. Physical disk comes from
+the change in used space on the volume, so it's approximate. `du` counts
+clones in full and shows 2694 MB for the 5-slot case.
 
 ## Commands
 
@@ -57,7 +80,8 @@ Cargo runs with `CARGO_SLOT_WORKTREE` set to the real worktree root.
 - The files mirrored are what `git ls-files --cached --others --exclude-standard`
   lists. Ignored files (like `.env`) and submodule contents are not mirrored.
 - Builds and tests run in the slot. Anything they write to the source tree
-  (e.g. snapshot updates) lands in the slot, not your worktree.
+  (e.g. snapshot updates) lands in the slot, not your worktree, and is
+  deleted on the next sync.
 - Artifacts live in the slot's target dir, not `./target`. `cargo slot run`
   handles this; for other uses, read the paths cargo prints.
 - `cargo slot run` holds its slot until the program exits.
