@@ -72,10 +72,12 @@ fn build(args: &[String]) -> Result<u8> {
     let slot = store.acquire(&repo, max_slots())?;
 
     let started = Instant::now();
-    let mut info = store.info(slot.id);
+    let mut info = slot.info();
     let mut manifest = slot.manifest();
     let same_origin = info.origin.as_deref() == Some(repo.root.as_path());
-    let stats = sync::sync(&repo, &slot.src(), &mut manifest, same_origin)?;
+    let files = repo.files()?;
+    let stats = sync::sync(&repo.root, &files, &slot.src(), &mut manifest, same_origin)?;
+    sync::write_git_pointer(&repo.git_dir, &slot.src())?;
     info.origin = Some(repo.root.clone());
     info.head = repo.head.clone();
     info.last_used = slot::now();
@@ -137,15 +139,14 @@ fn status() -> Result<()> {
     let store = slot::Store::open(&repo)?;
     println!("{}", store.dir.display());
     let now = slot::now();
-    for id in store.ids()? {
-        let info = store.info(id);
-        let busy = store.try_lock(id)?.is_none();
-        let origin = info.origin.map_or("-".into(), |p| p.display().to_string());
-        let head = info.head.get(..8).unwrap_or("-");
-        let ago = if info.last_used == 0 { "never".into() } else { fmt_ago(now.saturating_sub(info.last_used)) };
+    for s in store.status()? {
+        let origin = s.info.origin.map_or("-".into(), |p| p.display().to_string());
+        let head = s.info.head.get(..8).unwrap_or("-");
+        let ago = if s.info.last_used == 0 { "never".into() } else { fmt_ago(now.saturating_sub(s.info.last_used)) };
         println!(
-            "  slot {id}  {:<4}  {head:<8}  {ago:>6}  {origin}",
-            if busy { "busy" } else { "idle" },
+            "  slot {}  {:<4}  {head:<8}  {ago:>6}  {origin}",
+            s.id,
+            if s.busy { "busy" } else { "idle" },
         );
     }
     Ok(())
@@ -154,15 +155,11 @@ fn status() -> Result<()> {
 fn gc(keep: usize) -> Result<()> {
     let repo = git::Repo::discover()?;
     let store = slot::Store::open(&repo)?;
-    let mut ids = store.ids()?;
-    ids.sort_by_key(|&id| std::cmp::Reverse(store.info(id).last_used));
-    for id in ids.into_iter().skip(keep) {
-        match store.try_lock(id)? {
-            Some(s) => {
-                std::fs::remove_dir_all(&s.dir)?;
-                println!("removed slot {id}");
-            }
-            None => println!("slot {id} is busy, skipped"),
+    for (id, removed) in store.gc(keep)? {
+        if removed {
+            println!("removed slot {id}");
+        } else {
+            println!("slot {id} is busy, skipped");
         }
     }
     Ok(())
