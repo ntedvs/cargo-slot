@@ -1,0 +1,53 @@
+name: Benchmark
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The runner's own disk (ext4) can't clone files copy-on-write, so
+      # measure on btrfs, where slots share blocks like they do on APFS.
+      - name: Mount btrfs scratch volume
+        run: |
+          sudo apt-get install -y -qq btrfs-progs >/dev/null
+          sudo truncate -s 20G /mnt/bench.img
+          sudo mkfs.btrfs -q /mnt/bench.img
+          sudo mkdir -p /bench
+          sudo mount -o loop /mnt/bench.img /bench
+          sudo chown "$USER" /bench
+          df -hT /bench
+
+      - name: Run benchmark
+        env:
+          BENCH_DIR: /bench
+          BENCH_FS_NOTE: btrfs (loopback)
+          # Measure cargo's defaults, not the CI toolchain action's.
+          CARGO_INCREMENTAL: ""
+          CARGO_TERM_COLOR: never
+        run: |
+          unset CARGO_INCREMENTAL
+          bench/ci.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bench/RESULTS.md bench/history.tsv
+          git commit -m "bench: update results [skip ci]" || exit 0
+          git pull --rebase -q
+          git push

@@ -79,6 +79,11 @@ gets your terminal directly; other commands go through the path rewriter.
 worktrees at different recent commits and builds each. Then each round
 edits one file per worktree and rebuilds all of them in turn.
 
+A [weekly CI job](.github/workflows/bench.yml) runs it on Linux with btrfs
+and commits the latest numbers to [bench/RESULTS.md](bench/RESULTS.md), with
+history in [bench/history.tsv](bench/history.tsv). Run the same thing
+locally with `bench/ci.sh`. The table below is a one-off run on a Mac.
+
 ripgrep (60 crates), 5 worktrees, 4 rounds, editing
 `crates/searcher/src/lib.rs`, debug builds, M-series Mac, APFS. CPU is
 user+sys including rustc, from one run.
@@ -122,4 +127,4 @@ to the real worktree root.
 - `cargo slot run` holds its slot until the program exits.
 - FIFOs, sockets and devices are not mirrored. Non-UTF-8 paths are an error.
 - On filesystems without reflinks, cloning a slot is a full copy.
-- Tested on macOS (APFS) and Linux (in Docker, overlayfs).
+- Tested on macOS (APFS) and Linux (overlayfs, and btrfs with reflinks).
