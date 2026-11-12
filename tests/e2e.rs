@@ -66,14 +66,23 @@ impl Fixture {
     }
 
     fn slot_raw(&self, args: &[&str], dir: &Path) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_cargo-slot"))
-            .args(args)
-            .current_dir(dir)
-            .env("CARGO_SLOT_HOME", &self.home)
-            .env("CARGO_SLOT_MAX", "2")
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .unwrap()
+        self.cmd(args, dir).output().unwrap()
+    }
+
+    /// `cargo-slot` with an environment independent of the caller's. CI sets
+    /// things like `CARGO_TERM_COLOR=always`, which breaks matching on
+    /// cargo's output, and `CARGO_INCREMENTAL=0`.
+    fn cmd(&self, args: &[&str], dir: &Path) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_cargo-slot"));
+        c.args(args).current_dir(dir).env("CARGO_SLOT_HOME", &self.home).env("CARGO_SLOT_MAX", "2");
+        for (k, _) in std::env::vars_os() {
+            let k = k.to_string_lossy();
+            if (k.starts_with("CARGO_") && !matches!(&*k, "CARGO_HOME")) || k.starts_with("RUSTFLAGS") {
+                c.env_remove(&*k);
+            }
+        }
+        c.env("CARGO_TERM_COLOR", "never");
+        c
     }
 
     fn build(&self, dir: &Path) -> String {
@@ -88,6 +97,7 @@ impl Fixture {
 }
 
 fn compiled(stderr: &str) -> bool {
+    assert!(stderr.contains("    Finished "), "no cargo summary in output:\n{stderr}");
     stderr.contains("Compiling demo")
 }
 
@@ -244,13 +254,7 @@ fn ignored_lockfile_is_kept() {
 fn include_env_mirrors_extra_ignored_files() {
     let f = Fixture::new();
     write(f.main.join("secret.env"), "s");
-    let out = Command::new(env!("CARGO_BIN_EXE_cargo-slot"))
-        .args(["build"])
-        .current_dir(&f.main)
-        .env("CARGO_SLOT_HOME", &f.home)
-        .env("CARGO_SLOT_INCLUDE", "secret.env")
-        .output()
-        .unwrap();
+    let out = f.cmd(&["build"], &f.main).env("CARGO_SLOT_INCLUDE", "secret.env").output().unwrap();
     assert!(out.status.success());
     assert!(f.slot_dir(1).join("src/secret.env").is_file());
 }
