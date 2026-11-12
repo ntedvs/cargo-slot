@@ -49,6 +49,9 @@ pub struct Entry {
     pub hash: String,
     #[serde(default)]
     pub link: bool,
+    /// Source permission bits.
+    #[serde(default)]
+    pub mode: u32,
     /// Mirrored file's metadata right after we wrote or verified it.
     /// If it no longer matches, something else touched the file.
     #[serde(default)]
@@ -60,6 +63,8 @@ pub struct Stamp {
     pub dev: u64,
     pub ino: u64,
     pub size: u64,
+    #[serde(default)]
+    pub mode: u32,
     pub mtime: i128,
     pub ctime: i128,
 }

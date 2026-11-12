@@ -2,9 +2,9 @@ use crate::slot::{Entry, Manifest, Stamp};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File, Metadata, Permissions};
 use std::io::ErrorKind;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,34 +21,29 @@ enum Outcome {
     Gone { removed: bool },
 }
 
-/// Make `dst` mirror `files` under `root`, writing only files whose content
-/// differs. Untouched files keep their mtimes, so cargo's fingerprints stay
-/// fresh for everything that didn't change.
+/// Make `dst` an exact mirror of `files` under `root`, plus the root `.git`
+/// pointer. Only files whose content differs are rewritten, so untouched
+/// files keep their mtimes and cargo's fingerprints stay fresh.
 ///
-/// Never writes outside `dst`: every parent directory is checked to be a real
-/// directory (not a symlink) before anything is written beneath it.
+/// Never writes outside `dst`: paths are normalized so no leaf is an
+/// ancestor of another, then every parent is made a real directory before
+/// any leaf is written. Leaves never change parents, so that holds while
+/// leaves sync in parallel.
 pub fn sync(root: &Path, files: &[String], dst: &Path, manifest: &mut Manifest, same_origin: bool) -> Result<Stats> {
     fs::create_dir_all(dst)?;
-    for rel in files {
-        check_rel(rel)?;
-    }
+    let files = normalize(root, files)?;
     let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
+    let dirs: HashSet<String> = files.iter().flat_map(|f| ancestors(f)).map(str::to_string).collect();
     let mut stats = Stats::default();
 
-    // 1. Drop entries that no longer exist, deepest first, so a path that
-    //    turns from file into directory (or back) is free before step 2.
-    let mut stale: Vec<&String> = manifest.keys().filter(|k| !wanted.contains(k.as_str())).collect();
-    stale.sort_by_key(|k| std::cmp::Reverse(k.matches('/').count()));
-    for rel in stale {
-        if remove_entry(dst, rel)? {
-            stats.removed += 1;
-        }
-    }
+    // 1. Delete anything in the mirror that isn't wanted: stale entries,
+    //    and files builds created. A leftover `src/bin/x.rs` would otherwise
+    //    add a target that doesn't exist in the worktree.
+    prune(dst, "", &wanted, &dirs, &mut stats.removed)?;
 
-    // 2. Make every parent a real directory. Sequential, so step 3 can run
-    //    in parallel touching only leaf paths.
+    // 2. Make every parent a real directory.
     let mut ready = HashSet::new();
-    for rel in files {
+    for rel in &files {
         ensure_parents(dst, rel, &mut ready)?;
     }
 
@@ -80,16 +75,76 @@ pub fn sync(root: &Path, files: &[String], dst: &Path, manifest: &mut Manifest, 
     Ok(stats)
 }
 
+/// Keep only paths that name a real leaf in the source: every ancestor is a
+/// real directory and no other listed path is an ancestor. Git can list both
+/// `a` and `a/x` when a tracked directory was replaced by a symlink or file
+/// without staging; then `a/x` isn't a real file and must be skipped.
+fn normalize(root: &Path, files: &[String]) -> Result<Vec<String>> {
+    for rel in files {
+        check_rel(rel)?;
+    }
+    let listed: HashSet<&str> = files.iter().map(String::as_str).collect();
+    let mut real_dirs: HashSet<&str> = HashSet::new();
+    let mut out = Vec::with_capacity(files.len());
+    'files: for rel in files {
+        for dir in ancestors(rel) {
+            if listed.contains(dir) {
+                continue 'files;
+            }
+            if !real_dirs.contains(dir) {
+                if !fs::symlink_metadata(root.join(dir)).is_ok_and(|m| m.is_dir()) {
+                    continue 'files;
+                }
+                real_dirs.insert(dir);
+            }
+        }
+        out.push(rel.clone());
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Proper ancestors of a relative path, shallowest first: "a/b/c" -> ["a", "a/b"].
+fn ancestors(rel: &str) -> impl Iterator<Item = &str> {
+    rel.match_indices('/').map(move |(i, _)| &rel[..i])
+}
+
+/// Recursively delete entries under `dst/dir` that are neither wanted leaves
+/// nor ancestors of one. Does not follow symlinks.
+fn prune(dst: &Path, dir: &str, wanted: &HashSet<&str>, dirs: &HashSet<String>, removed: &mut usize) -> Result<()> {
+    for entry in fs::read_dir(dst.join(dir))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if dir.is_empty() && name == ".git" {
+            continue;
+        }
+        let rel = if dir.is_empty() { name } else { format!("{dir}/{name}") };
+        let ft = entry.file_type()?;
+        if ft.is_dir() && dirs.contains(&rel) {
+            prune(dst, &rel, wanted, dirs, removed)?;
+        } else if wanted.contains(rel.as_str()) && !ft.is_dir() {
+            // Kept; sync_one fixes type or content.
+        } else {
+            if ft.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+            *removed += 1;
+        }
+    }
+    Ok(())
+}
+
 fn sync_one(root: &Path, dst: &Path, rel: &str, old: Option<&Entry>, same_origin: bool) -> Result<Outcome> {
     let s = root.join(rel);
     let d = dst.join(rel);
     let md = match fs::symlink_metadata(&s) {
         Ok(m) if !m.is_dir() => m,
         // Deleted but still in the index, or a submodule: not mirrored.
-        Ok(_) => return Ok(Outcome::Gone { removed: old.is_some() && remove_leaf(&d)? }),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Ok(Outcome::Gone { removed: old.is_some() && remove_leaf(&d)? });
-        }
+        Ok(_) => return Ok(Outcome::Gone { removed: remove_leaf(&d)? }),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Outcome::Gone { removed: remove_leaf(&d)? }),
         Err(e) => return Err(e.into()),
     };
     let dmd = fs::symlink_metadata(&d).ok();
@@ -108,17 +163,18 @@ fn sync_one(root: &Path, dst: &Path, rel: &str, old: Option<&Entry>, same_origin
 
     let size = md.len();
     let mtime = nanos(md.modified()?);
+    let mode = md.mode() & 0o7777;
     let dst_stamp = dmd.as_ref().filter(|m| m.is_file()).map(stamp);
 
-    // Fast path: destination is exactly as we left it.
+    // Fast path: source unchanged and destination exactly as we left it.
     if let (Some(o), Some(st)) = (old, &dst_stamp) {
-        if !o.link && o.dst.as_ref() == Some(st) && same_origin && o.size == size && o.mtime == mtime {
+        if !o.link && o.dst.as_ref() == Some(st) && same_origin && o.size == size && o.mtime == mtime && o.mode == mode {
             return Ok(Outcome::Same(o.clone()));
         }
     }
 
     let hash = hash_file(&s)?;
-    let mut entry = Entry { size, mtime, hash, link: false, dst: None };
+    let mut entry = Entry { size, mtime, mode, hash, link: false, dst: None };
 
     if let Some(st) = dst_stamp {
         let trusted = old.is_some_and(|o| !o.link && o.dst.as_ref() == Some(&st));
@@ -130,8 +186,15 @@ fn sync_one(root: &Path, dst: &Path, rel: &str, old: Option<&Entry>, same_origin
             st.size == size && hash_file(&d)? == entry.hash
         };
         if same {
-            entry.dst = Some(st);
-            return Ok(Outcome::Same(entry));
+            if st.mode == mode {
+                entry.dst = Some(st);
+                return Ok(Outcome::Same(entry));
+            }
+            // Only permissions differ. chmod leaves mtime alone, so cargo
+            // doesn't rebuild for it.
+            fs::set_permissions(&d, Permissions::from_mode(mode))?;
+            entry.dst = Some(stamp(&fs::symlink_metadata(&d)?));
+            return Ok(Outcome::Copied(entry));
         }
     }
 
@@ -140,6 +203,7 @@ fn sync_one(root: &Path, dst: &Path, rel: &str, old: Option<&Entry>, same_origin
     let tmp = d.with_file_name(format!(".{name}.cargo-slot-tmp"));
     clear(&tmp)?;
     fs::copy(&s, &tmp)?;
+    fs::set_permissions(&tmp, Permissions::from_mode(mode))?;
     // fs::copy may clone and keep the source mtime. Cargo decides freshness
     // by mtime, so a changed file must look newer than any prior build.
     File::options().write(true).open(&tmp)?.set_modified(SystemTime::now())?;
@@ -160,10 +224,8 @@ fn check_rel(rel: &str) -> Result<()> {
 /// Ensure each ancestor of `rel` under `dst` is a real directory, replacing
 /// files or symlinks in the way.
 fn ensure_parents(dst: &Path, rel: &str, ready: &mut HashSet<PathBuf>) -> Result<()> {
-    let mut cur = dst.to_path_buf();
-    let Some(parent) = Path::new(rel).parent() else { return Ok(()) };
-    for comp in parent.components() {
-        cur.push(comp);
+    for dir in ancestors(rel) {
+        let cur = dst.join(dir);
         if ready.contains(&cur) {
             continue;
         }
@@ -176,33 +238,9 @@ fn ensure_parents(dst: &Path, rel: &str, ready: &mut HashSet<PathBuf>) -> Result
             Err(e) if e.kind() == ErrorKind::NotFound => fs::create_dir(&cur)?,
             Err(e) => return Err(e.into()),
         }
-        ready.insert(cur.clone());
+        ready.insert(cur);
     }
     Ok(())
-}
-
-/// True if every ancestor of `rel` under `dst` is a real directory.
-fn parents_are_dirs(dst: &Path, rel: &str) -> bool {
-    let mut cur = dst.to_path_buf();
-    let Some(parent) = Path::new(rel).parent() else { return true };
-    parent.components().all(|c| {
-        cur.push(c);
-        fs::symlink_metadata(&cur).is_ok_and(|m| m.is_dir())
-    })
-}
-
-/// Remove a previously mirrored file or symlink, if reachable without
-/// following symlinks. Directories are left to `ensure_parents`/`clear`.
-fn remove_entry(dst: &Path, rel: &str) -> Result<bool> {
-    if !parents_are_dirs(dst, rel) {
-        return Ok(false);
-    }
-    let p = dst.join(rel);
-    let removed = remove_leaf(&p)?;
-    if removed {
-        prune_empty_parents(dst, &p);
-    }
-    Ok(removed)
 }
 
 fn remove_leaf(p: &Path) -> Result<bool> {
@@ -223,16 +261,6 @@ fn clear(p: &Path) -> Result<()> {
         Err(_) => {}
     }
     Ok(())
-}
-
-fn prune_empty_parents(root: &Path, p: &Path) {
-    let mut cur = p.parent();
-    while let Some(dir) = cur {
-        if dir == root || fs::remove_dir(dir).is_err() {
-            break;
-        }
-        cur = dir.parent();
-    }
 }
 
 /// Point the mirror's `.git` at the real worktree's git dir, so build
@@ -256,6 +284,7 @@ fn stamp(m: &Metadata) -> Stamp {
         dev: m.dev(),
         ino: m.ino(),
         size: m.size(),
+        mode: m.mode() & 0o7777,
         mtime: m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128,
         ctime: m.ctime() as i128 * 1_000_000_000 + m.ctime_nsec() as i128,
     }
@@ -412,5 +441,68 @@ mod tests {
         let mut m = Manifest::new();
         let e = Env::new();
         assert!(sync(&e.src, &["../x".into()], &e.dst, &mut m, true).is_err());
+    }
+
+    #[test]
+    fn listed_leaf_and_descendant_does_not_traverse() {
+        // Git lists both `a` (now a symlink) and stale tracked `a/x`.
+        let mut e = Env::new();
+        e.write("a/x", "old");
+        e.sync(&["a/x"]);
+        fs::remove_dir_all(e.src.join("a")).unwrap();
+        fs::write(e.outside.join("x"), "victim").unwrap();
+        symlink(&e.outside, e.src.join("a")).unwrap();
+        e.sync(&["a", "a/x"]);
+        assert_eq!(fs::read_to_string(e.outside.join("x")).unwrap(), "victim");
+        assert!(fs::symlink_metadata(e.dst.join("a")).unwrap().file_type().is_symlink());
+        assert!(!e.manifest.contains_key("a/x"));
+    }
+
+    #[test]
+    fn descendant_of_source_symlink_is_skipped() {
+        // Only `a/x` listed, but `a` is a symlink in the source: not a real file.
+        let mut e = Env::new();
+        fs::write(e.outside.join("x"), "outside").unwrap();
+        symlink(&e.outside, e.src.join("a")).unwrap();
+        let st = e.sync(&["a/x"]);
+        assert_eq!(st.files, 0);
+        assert!(!e.dst.join("a").exists());
+    }
+
+    #[test]
+    fn mode_changes_sync_without_touching_mtime() {
+        let mut e = Env::new();
+        e.write("run.sh", "#!/bin/sh");
+        fs::set_permissions(e.src.join("run.sh"), Permissions::from_mode(0o644)).unwrap();
+        e.sync(&["run.sh"]);
+        let before = fs::metadata(e.dst.join("run.sh")).unwrap().modified().unwrap();
+
+        fs::set_permissions(e.src.join("run.sh"), Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(e.sync(&["run.sh"]).copied, 1);
+        let md = fs::metadata(e.dst.join("run.sh")).unwrap();
+        assert_eq!(md.mode() & 0o777, 0o755);
+        assert_eq!(md.modified().unwrap(), before);
+
+        // A chmod inside the slot is also undone.
+        fs::set_permissions(e.dst.join("run.sh"), Permissions::from_mode(0o600)).unwrap();
+        e.sync(&["run.sh"]);
+        assert_eq!(fs::metadata(e.dst.join("run.sh")).unwrap().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn removes_files_created_in_slot() {
+        let mut e = Env::new();
+        e.write("src/main.rs", "fn main() {}");
+        e.sync(&["src/main.rs"]);
+        fs::create_dir_all(e.dst.join("src/bin")).unwrap();
+        fs::write(e.dst.join("src/bin/ghost.rs"), "fn main() {}").unwrap();
+        fs::write(e.dst.join("stray"), "").unwrap();
+        fs::write(e.dst.join(".git"), "gitdir: x").unwrap();
+        let st = e.sync(&["src/main.rs"]);
+        assert_eq!(st.removed, 2);
+        assert!(!e.dst.join("src/bin").exists());
+        assert!(!e.dst.join("stray").exists());
+        assert!(e.dst.join(".git").exists(), "git pointer is kept");
+        assert!(e.dst.join("src/main.rs").exists());
     }
 }

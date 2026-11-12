@@ -34,7 +34,11 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 impl Repo {
     pub fn discover() -> Result<Self> {
-        let cwd = std::env::current_dir()?.canonicalize()?;
+        Self::discover_at(&std::env::current_dir()?)
+    }
+
+    pub fn discover_at(dir: &Path) -> Result<Self> {
+        let cwd = dir.canonicalize()?;
         let root = PathBuf::from(
             git(&cwd, &["rev-parse", "--show-toplevel"]).context("not inside a git worktree")?,
         )
